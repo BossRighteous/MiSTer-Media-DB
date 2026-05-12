@@ -1,3 +1,8 @@
+csv/
+export/
+mister_media.db
+.claude/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

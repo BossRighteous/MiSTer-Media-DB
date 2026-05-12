@@ -1,0 +1,4 @@
+# No external dependencies required for core functionality
+# sqlite3 is part of Python stdlib
+
+tzdata  # IANA timezone database for Windows (zoneinfo stdlib needs this on Windows)

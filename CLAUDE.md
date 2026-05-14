@@ -17,7 +17,10 @@ python main.py --systems nes snes
 # Combine
 python main.py --steps fetch-game-details download-images --systems n64 psx
 
-# Custom DB path
+# Custom artifact path (DB + exports root); also settable via ARTIFACT_PATH env var
+python main.py --artifact-path /mnt/mister
+
+# Custom DB path (relative to artifact-path, or absolute)
 python main.py --db /path/to/custom.db
 
 # Verbose logging

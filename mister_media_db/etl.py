@@ -1,10 +1,12 @@
 """ETL workflow and step definitions."""
 
+import atexit
 import csv
 import html
 import io
 import json
 import os
+import signal
 import sqlite3
 import logging
 import time
@@ -15,6 +17,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List
 from zoneinfo import ZoneInfo
+
+
+def _sigbreak_handler(signum, frame):
+    raise KeyboardInterrupt()
+
+
+if hasattr(signal, "SIGBREAK"):
+    signal.signal(signal.SIGBREAK, _sigbreak_handler)
 
 from mister_media_db.media_types import MEDIA_TYPE_MAP, MediaType
 from mister_media_db.slugs import slugify_game_str
@@ -64,10 +74,15 @@ class ETLWorkflow:
         "export-zaparoo-map",
     ]
 
-    def __init__(self, db_path: str = "mister_media.db"):
-        self.db_path = Path(db_path)
+    def __init__(self, db_path: str = "mister_media.db", artifact_path: Optional[str] = None):
         self.conn: Optional[sqlite3.Connection] = None
         _load_dotenv(Path(".env"))
+        resolved_artifact = Path(artifact_path) if artifact_path else Path(os.environ.get("ARTIFACT_PATH", "."))
+        self.artifact_path = resolved_artifact.resolve()
+        if self.artifact_path != Path(".").resolve():
+            _load_dotenv(self.artifact_path / ".env")
+        db = Path(db_path)
+        self.db_path = db if db.is_absolute() else self.artifact_path / db
         missing = [k for k in _SS_ENV_VARS if not os.environ.get(k)]
         if missing:
             raise ValueError(f"Missing required env vars: {', '.join(missing)}")
@@ -80,12 +95,14 @@ class ETLWorkflow:
     def connect(self):
         """Connect to SQLite database."""
         self.conn = sqlite3.connect(self.db_path)
+        atexit.register(self.close)
         logger.info(f"Connected to database: {self.db_path}")
 
     def close(self):
         """Close database connection."""
         if self.conn:
             self.conn.close()
+            self.conn = None
             logger.info("Database connection closed")
 
     def run(
@@ -114,6 +131,9 @@ class ETLWorkflow:
                 logger.info(f"Running step: {step}")
                 self._execute_step(step, systems_to_process)
 
+        except KeyboardInterrupt:
+            logger.warning("Interrupted — closing database")
+            raise
         finally:
             self.close()
 
@@ -524,7 +544,7 @@ class ETLWorkflow:
         }
         _INVALID_CHARS = str.maketrans('\\/:*?"<>|', '_________')
 
-        base = Path("export") / "media"
+        base = self.artifact_path / "export" / "media"
 
         for system in systems:
             system_dir = base / system.mister_media_dirname
@@ -565,7 +585,7 @@ class ETLWorkflow:
     def step_export_zaparoo_map(self, systems: List[System]):
         """Export zaparoometa JSON fragments per game to ./export/zaparoometa/."""
         _INVALID_CHARS = str.maketrans('\\/:*?"<>|', '_________')
-        base = Path("export") / "zaparoometa"
+        base = self.artifact_path / "export" / "zaparoometa"
 
         for system in systems:
             system_dir = base / system.mister_media_dirname

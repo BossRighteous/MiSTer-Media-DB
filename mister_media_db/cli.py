@@ -43,9 +43,16 @@ Examples:
     )
 
     parser.add_argument(
+        "-a", "--artifact-path",
+        default=None,
+        metavar="PATH",
+        help="Root path for DB and exports (default: ARTIFACT_PATH env var or current directory)",
+    )
+
+    parser.add_argument(
         "-d", "--db",
         default="mister_media.db",
-        help="Path to SQLite database (default: mister_media.db)",
+        help="Path to SQLite database, relative to artifact-path if not absolute (default: mister_media.db)",
     )
 
     parser.add_argument(
@@ -71,7 +78,7 @@ def main(args=None):
     parsed = parse_args(args)
     setup_logging(parsed.verbose)
 
-    workflow = ETLWorkflow(db_path=parsed.db)
+    workflow = ETLWorkflow(db_path=parsed.db, artifact_path=parsed.artifact_path)
     workflow.run(steps=parsed.steps, systems=parsed.systems)
 
 

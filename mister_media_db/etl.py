@@ -13,6 +13,7 @@ import time
 import urllib.parse
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List
@@ -43,6 +44,7 @@ _SS_ENV_VARS = [
     "SS_USER_ID",
     "SS_USER_PASSWORD",
     "SS_SOFTNAME",
+    "SS_THREADS",
 ]
 
 
@@ -91,6 +93,10 @@ class ETLWorkflow:
         self.ss_user_id = os.environ["SS_USER_ID"]
         self.ss_user_password = os.environ["SS_USER_PASSWORD"]
         self.ss_softname = os.environ["SS_SOFTNAME"]
+        try:
+            self.ss_threads = max(1, int(os.environ.get("SS_THREADS", "") or "1"))
+        except (ValueError, TypeError):
+            self.ss_threads = 1
 
     def connect(self):
         """Connect to SQLite database."""
@@ -260,8 +266,6 @@ class ETLWorkflow:
 
     def step_fetch_game_details(self, systems: List[System]):
         """Fetch game details from ScreenScraper for games missing a fetch response."""
-        paris = ZoneInfo("Europe/Paris")
-
         for system in systems:
             game_ids = [
                 row[0]
@@ -279,55 +283,31 @@ class ETLWorkflow:
             ).fetchone()[0]
             logger.info(f"  {system.zaparoo_id}: {len(game_ids)}/{total_games} games to fetch")
 
-            for game_id in game_ids:
-                url = (
-                    "https://api.screenscraper.fr/api2/jeuInfos.php"
-                    f"?gameid={game_id}"
-                    f"&devid={urllib.parse.quote(self.ss_dev_id)}"
-                    f"&devpassword={urllib.parse.quote(self.ss_dev_password)}"
-                    f"&softname={urllib.parse.quote(self.ss_softname)}"
-                    f"&ssid={urllib.parse.quote(self.ss_user_id)}"
-                    f"&sspassword={urllib.parse.quote(self.ss_user_password)}"
-                    f"&output=json"
-                )
-                try:
-                    with urllib.request.urlopen(url) as response:
-                        blob = response.read()
-                except urllib.error.HTTPError as e:
-                    logger.error(f"  HTTP {e.code} fetching game {game_id}: {e.reason}")
-                    continue
-                except urllib.error.URLError as e:
-                    logger.error(f"  URL error fetching game {game_id}: {e.reason}")
-                    continue
-
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO GameFetchResponses (screenscraper_id, blob) VALUES (?, ?)",
-                    (game_id, blob),
-                )
-                self.conn.commit()
-
-                try:
-                    payload = json.loads(blob)
-                    ssuser = payload["response"]["ssuser"]
-                    requests_today = int(ssuser["requeststoday"])
-                    max_requests = int(ssuser["maxrequestsperday"])
-                except (KeyError, ValueError, json.JSONDecodeError):
-                    logger.warning(f"  Could not parse rate limit from response for game {game_id}")
-                    continue
-
-                logger.info(f"  game {game_id}: fetched ({len(blob)} bytes), {requests_today}/{max_requests} requests today")
-
-                if requests_today >= max_requests:
-                    now = datetime.now(paris)
-                    midnight = (now + timedelta(days=1)).replace(
-                        hour=0, minute=0, second=0, microsecond=0
+            for batch_start in range(0, len(game_ids), self.ss_threads):
+                batch = game_ids[batch_start:batch_start + self.ss_threads]
+                with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+                    futures = [executor.submit(self._fetch_game_detail, gid) for gid in batch]
+                last_rate_info: Optional[tuple[int, int]] = None
+                for future in futures:
+                    game_id, blob = future.result()
+                    if blob is None:
+                        continue
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO GameFetchResponses (screenscraper_id, blob) VALUES (?, ?)",
+                        (game_id, blob),
                     )
-                    sleep_seconds = (midnight - now).total_seconds()
-                    logger.warning(
-                        f"  Rate limit reached ({requests_today}/{max_requests}). "
-                        f"Sleeping {sleep_seconds:.0f}s until midnight Paris time ({midnight.isoformat()})"
-                    )
-                    time.sleep(sleep_seconds)
+                    self.conn.commit()
+                    try:
+                        payload = json.loads(blob)
+                        ssuser = payload["response"]["ssuser"]
+                        requests_today = int(ssuser["requeststoday"])
+                        max_requests = int(ssuser["maxrequestsperday"])
+                        last_rate_info = (requests_today, max_requests)
+                        logger.info(f"  game {game_id}: fetched ({len(blob)} bytes), {requests_today}/{max_requests} requests today")
+                    except (KeyError, ValueError, json.JSONDecodeError):
+                        logger.warning(f"  Could not parse rate limit from response for game {game_id}")
+                if last_rate_info and last_rate_info[0] >= last_rate_info[1]:
+                    self._sleep_until_paris_midnight()
 
             done_count = self.conn.execute(
                 """SELECT COUNT(*) FROM GameFetchResponses gfr
@@ -377,6 +357,30 @@ class ETLWorkflow:
             f"  Rate limit reached. Sleeping {sleep_seconds:.0f}s until midnight Paris time ({midnight.isoformat()})"
         )
         time.sleep(sleep_seconds)
+
+    def _fetch_url(self, url: str, label: str = "") -> Optional[bytes]:
+        try:
+            with urllib.request.urlopen(url) as response:
+                return response.read()
+        except urllib.error.HTTPError as e:
+            logger.error(f"  HTTP {e.code} fetching {label or url}: {e.reason}")
+            return None
+        except urllib.error.URLError as e:
+            logger.error(f"  URL error fetching {label or url}: {e.reason}")
+            return None
+
+    def _fetch_game_detail(self, game_id: int) -> tuple[int, Optional[bytes]]:
+        url = (
+            "https://api.screenscraper.fr/api2/jeuInfos.php"
+            f"?gameid={game_id}"
+            f"&devid={urllib.parse.quote(self.ss_dev_id)}"
+            f"&devpassword={urllib.parse.quote(self.ss_dev_password)}"
+            f"&softname={urllib.parse.quote(self.ss_softname)}"
+            f"&ssid={urllib.parse.quote(self.ss_user_id)}"
+            f"&sspassword={urllib.parse.quote(self.ss_user_password)}"
+            f"&output=json"
+        )
+        return game_id, self._fetch_url(url, f"game {game_id}")
 
     def step_download_images(self, systems: List[System]):
         """Download game images for target media types; skips already-fetched rows."""
@@ -435,7 +439,15 @@ class ETLWorkflow:
                 )
             }
 
+            games_processed = 0
             for screenscraper_id in game_ids:
+                games_processed += 1
+                if games_processed % 1000 == 0:
+                    remaining = self._fetch_remaining_requests()
+                    if remaining == 0:
+                        self._sleep_until_paris_midnight()
+                        remaining = self._fetch_remaining_requests()
+
                 row = self.conn.execute(
                     "SELECT blob FROM GameFetchResponses WHERE screenscraper_id = ?",
                     (screenscraper_id,),
@@ -467,6 +479,7 @@ class ETLWorkflow:
                 if not needed:
                     continue
 
+                valid_needed_map: dict[tuple, tuple] = {}
                 for media in needed:
                     mt = MEDIA_TYPE_MAP[media["type"]]
                     region = media.get("region", "")
@@ -479,38 +492,36 @@ class ETLWorkflow:
                             f"missing url or unknown format '{fmt}'"
                         )
                         continue
+                    valid_needed_map[(mt, region)] = (mt, region, url, content_type)
+                valid_needed = list(valid_needed_map.values())
 
+                for i in range(0, len(valid_needed), self.ss_threads):
+                    sub_batch = valid_needed[i:i + self.ss_threads]
                     if remaining == 0:
                         self._sleep_until_paris_midnight()
                         remaining = self._fetch_remaining_requests()
-
-                    try:
-                        with urllib.request.urlopen(url) as response:
-                            image_blob = response.read()
-                    except urllib.error.HTTPError as e:
-                        logger.error(
-                            f"  HTTP {e.code} fetching {mt.name}[{region}]"
-                            f" for game {screenscraper_id}: {e.reason}"
+                    with ThreadPoolExecutor(max_workers=len(sub_batch)) as executor:
+                        batch_futures = [
+                            (mt, region, content_type, executor.submit(
+                                self._fetch_url, url, f"game {screenscraper_id} {mt.name}[{region}]"
+                            ))
+                            for mt, region, url, content_type in sub_batch
+                        ]
+                    for mt, region, content_type, future in batch_futures:
+                        image_blob = future.result()
+                        if image_blob is None:
+                            continue
+                        self.conn.execute(
+                            "INSERT INTO GameImages (screenscraper_id, type, region, content_type, blob)"
+                            " VALUES (?, ?, ?, ?, ?)",
+                            (screenscraper_id, mt, region, content_type, image_blob),
                         )
-                        continue
-                    except urllib.error.URLError as e:
-                        logger.error(
-                            f"  URL error fetching {mt.name}[{region}]"
-                            f" for game {screenscraper_id}: {e.reason}"
+                        self.conn.commit()
+                        done.add((screenscraper_id, mt, region))
+                        remaining -= 1
+                        logger.info(
+                            f"  game {screenscraper_id}: stored {mt.name}[{region}] ({len(image_blob)} bytes)"
                         )
-                        continue
-
-                    self.conn.execute(
-                        "INSERT INTO GameImages (screenscraper_id, type, region, content_type, blob)"
-                        " VALUES (?, ?, ?, ?, ?)",
-                        (screenscraper_id, mt, region, content_type, image_blob),
-                    )
-                    self.conn.commit()
-                    done.add((screenscraper_id, mt, region))
-                    remaining -= 1
-                    logger.info(
-                        f"  game {screenscraper_id}: stored {mt.name}[{region}] ({len(image_blob)} bytes)"
-                    )
 
             row = self.conn.execute(
                 f"""

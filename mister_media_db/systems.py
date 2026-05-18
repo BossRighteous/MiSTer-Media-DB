@@ -537,13 +537,14 @@ SYSTEMS: list[System] = [
         screenscraper_id=76,
     ),
     # Other
-    System(
-        zaparoo_id="Arcade",
-        mister_media_dirname="_Arcade",
-        mister_folders=["_Arcade"],
-        mister_core_name="Arcade",
-        screenscraper_id=75,
-    ),
+    # Arcade must be run custom for MRA matching
+    # System(
+    #     zaparoo_id="Arcade",
+    #     mister_media_dirname="_Arcade",
+    #     mister_folders=["_Arcade"],
+    #     mister_core_name="Arcade",
+    #     screenscraper_id=75,
+    # ),
     System(
         zaparoo_id="Arduboy",
         mister_media_dirname="Arduboy",

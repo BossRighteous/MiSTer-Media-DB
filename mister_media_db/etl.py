@@ -72,6 +72,7 @@ class ETLWorkflow:
         "process-system-csv",
         "fetch-game-details",
         "download-images",
+        "get-zaparoo-mediatitles",
         "export-media",
         "export-zaparoo-map",
     ]
@@ -114,20 +115,27 @@ class ETLWorkflow:
     def run(
         self,
         steps: Optional[List[str]] = None,
-        systems: Optional[List[System]] = None,
+        systems: Optional[List[str]] = None,
     ):
         """
         Execute ETL workflow.
 
         Args:
-            steps: List of step names to run. If None, run all steps.
-            systems: List of System instances to process. If None, process all systems.
+            steps: Step names to run. If None, run all steps.
+            systems: zaparoo_id strings to process. If None, process all systems.
         """
         self.connect()
 
         try:
             steps_to_run = steps if steps else self.STEPS
-            systems_to_process = systems if systems else SYSTEMS
+            if systems:
+                system_map = {s.zaparoo_id: s for s in SYSTEMS}
+                unknown = [sid for sid in systems if sid not in system_map]
+                if unknown:
+                    raise ValueError(f"Unknown system IDs: {', '.join(unknown)}")
+                systems_to_process = [system_map[sid] for sid in systems]
+            else:
+                systems_to_process = SYSTEMS
 
             for step in steps_to_run:
                 if step not in self.STEPS:
@@ -181,6 +189,14 @@ class ETLWorkflow:
                 CREATE TABLE GameFetchResponses (
                     screenscraper_id INTEGER PRIMARY KEY,
                     blob BLOB NOT NULL
+                );
+
+                CREATE TABLE GameZaparooTitles (
+                    id INTEGER PRIMARY KEY,
+                    screenscraper_id INTEGER NOT NULL,
+                    slug TEXT NOT NULL,
+                    result TEXT NOT NULL,
+                    UNIQUE(screenscraper_id, slug)
                 );
             """)
             self.conn.commit()
@@ -546,6 +562,108 @@ class ETLWorkflow:
                 )
             else:
                 logger.info(f"  {system.zaparoo_id}: {complete}/{processed} games fully downloaded, complete")
+
+    def _post_json(self, url: str, body: bytes, label: str = "") -> Optional[dict]:
+        req = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req) as response:
+                payload = json.loads(response.read())
+            return payload.get("result")
+        except urllib.error.HTTPError as e:
+            logger.error(f"  HTTP {e.code} posting {label or url}: {e.reason}")
+            return None
+        except urllib.error.URLError as e:
+            logger.error(f"  URL error posting {label or url}: {e.reason}")
+            return None
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"  Cannot parse response for {label or url}: {e}")
+            return None
+
+    def step_get_zaparoo_mediatitles(self, systems: List[System]):
+        """Fetch zaparoo media title slugs for all rom filenames via Zaparoo JSON-RPC API."""
+        zaparoo_host = os.environ.get("ZAPAROO_HOST")
+        if not zaparoo_host:
+            logger.error("  ZAPAROO_HOST env var not set: skipping get-zaparoo-mediatitles")
+            return
+
+        base_url = f"http://{zaparoo_host}:7497/api/v0.1"
+
+        for system in systems:
+            game_ids: List[int] = [
+                row[0]
+                for row in self.conn.execute(
+                    """
+                    SELECT g.screenscraper_id
+                    FROM Games g
+                    JOIN GameFetchResponses gfr ON g.screenscraper_id = gfr.screenscraper_id
+                    WHERE g.system_id = ?
+                    """,
+                    (system.zaparoo_id,),
+                )
+            ]
+            logger.info(f"  {system.zaparoo_id}: {len(game_ids)} game responses to process")
+
+            inserted_system = 0
+            for screenscraper_id in game_ids:
+                row = self.conn.execute(
+                    "SELECT blob FROM GameFetchResponses WHERE screenscraper_id = ?",
+                    (screenscraper_id,),
+                ).fetchone()
+                if not row:
+                    continue
+                blob = row[0]
+                try:
+                    payload = json.loads(blob)
+                    roms = payload["response"]["jeu"]["roms"]
+                except (KeyError, ValueError, json.JSONDecodeError) as e:
+                    logger.warning(f"  {system.zaparoo_id}: cannot parse roms: {e}")
+                    continue
+
+                existing_slugs: set[str] = {
+                    row[0]
+                    for row in self.conn.execute(
+                        "SELECT slug FROM GameZaparooTitles WHERE screenscraper_id = ?",
+                        (screenscraper_id,),
+                    )
+                }
+
+                for rom in roms:
+                    romfilename = rom.get("romfilename")
+                    if not romfilename:
+                        continue
+
+                    body = json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "mediatitle.frompath",
+                        "params": {
+                            "systemId": system.zaparoo_id,
+                            "path": romfilename,
+                        },
+                    }).encode("utf-8")
+
+                    result = self._post_json(
+                        base_url, body, label=f"{system.zaparoo_id}/{romfilename}"
+                    )
+                    if result is None:
+                        continue
+
+                    slug = result.get("slug")
+                    if not slug or slug in existing_slugs:
+                        continue
+
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO GameZaparooTitles (screenscraper_id, slug, result)"
+                        " VALUES (?, ?, ?)",
+                        (screenscraper_id, slug, json.dumps(result)),
+                    )
+                    self.conn.commit()
+                    existing_slugs.add(slug)
+                    inserted_system += 1
+
+            logger.info(f"  {system.zaparoo_id}: {inserted_system} new slug records inserted")
 
     def step_export_media(self, systems: List[System]):
         """Export media files to ./export/media/{system.mister_media_dirname}/."""

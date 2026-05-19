@@ -38,6 +38,24 @@ def _clean_text(text: str) -> str:
     return " ".join(html.unescape(text).split())
 
 
+_NOM_REGION_PRIORITY = ["ss", "wor", "us", "eu", "jp"]
+
+
+def _pick_nom(noms: list) -> Optional[str]:
+    by_region = {n.get("region", ""): n.get("text", "") for n in noms if n.get("text")}
+    for region in _NOM_REGION_PRIORITY:
+        if region in by_region:
+            text = by_region[region]
+            cleaned = html.unescape(text).replace("\t", "").replace("\n", "").replace("\r", "").strip()
+            if cleaned:
+                return cleaned
+    for text in by_region.values():
+        cleaned = html.unescape(text).replace("\t", "").replace("\n", "").replace("\r", "").strip()
+        if cleaned:
+            return cleaned
+    return None
+
+
 _SS_ENV_VARS = [
     "SS_DEV_ID",
     "SS_DEV_PASSWORD",
@@ -173,7 +191,8 @@ class ETLWorkflow:
                     screenscraper_id INTEGER PRIMARY KEY,
                     system_id TEXT NOT NULL,
                     name TEXT NOT NULL,
-                    image_count INTEGER
+                    image_count INTEGER,
+                    zaparoo_title TEXT,
                 );
 
                 CREATE TABLE GameImages (
@@ -616,10 +635,19 @@ class ETLWorkflow:
                 blob = row[0]
                 try:
                     payload = json.loads(blob)
-                    roms = payload["response"]["jeu"]["roms"]
+                    jeu = payload["response"]["jeu"]
+                    roms = jeu["roms"]
                 except (KeyError, ValueError, json.JSONDecodeError) as e:
                     logger.warning(f"  {system.zaparoo_id}: cannot parse roms: {e}")
                     continue
+
+                zaparoo_title = _pick_nom(jeu.get("noms", []))
+                if zaparoo_title:
+                    self.conn.execute(
+                        "UPDATE Games SET zaparoo_title = ? WHERE screenscraper_id = ? AND zaparoo_title IS NULL",
+                        (zaparoo_title, screenscraper_id),
+                    )
+                    self.conn.commit()
 
                 existing_slugs: set[str] = {
                     row[0]

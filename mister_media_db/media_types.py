@@ -14,7 +14,9 @@ class MediaType(StrEnum):
     VIDEO = "video"
     # video-normalized = Vidéo normalisée               / Normalized Video
     VIDEO_NORMALIZED = "video-normalized"
-    # screenmarquee    = Marquee                        / Arcade Marquee / Banner
+    # marquee          = Marquee                        / Arcade Marquee / Banner
+    MARQUEE = "marquee"
+    # screenmarquee    = Screen Marquee                 / Arcade Marquee / for leds?
     SCREENMARQUEE = "screenmarquee"
     # screenmarqueesmall = Petit Marquee                / Small Marquee
     SCREENMARQUEESMALL = "screenmarqueesmall"
@@ -54,6 +56,8 @@ class MediaType(StrEnum):
     PICTOMONOCHROME = "pictomonochrome"
     # pictocouleur     = Pictogramme Couleur            / Color Pictogram
     PICTOCOULEUR = "pictocouleur"
+    # flyer            = Flyer                          / Info flyer
+    FLYER = "flyer"
 
 
 # Maps raw API 'type' string → MediaType enum

@@ -441,6 +441,17 @@ class ETLWorkflow:
             remaining = self._fetch_remaining_requests()
 
         for system in systems:
+            null_count = self.conn.execute(
+                "SELECT COUNT(*) FROM Games WHERE system_id = ? AND image_count IS NULL",
+                (system.zaparoo_id,),
+            ).fetchone()[0]
+            if null_count == 0:
+                total_games = self.conn.execute(
+                    "SELECT COUNT(*) FROM Games WHERE system_id = ?", (system.zaparoo_id,)
+                ).fetchone()[0]
+                logger.info(f"  {system.zaparoo_id}: all {total_games} games already scanned, skipping")
+                continue
+
             # Fetch only IDs — avoids holding all blobs in memory at once
             game_ids: List[int] = [
                 row[0]
@@ -449,12 +460,12 @@ class ETLWorkflow:
                     SELECT g.screenscraper_id
                     FROM Games g
                     JOIN GameFetchResponses gfr ON g.screenscraper_id = gfr.screenscraper_id
-                    WHERE g.system_id = ?
+                    WHERE g.system_id = ? AND g.image_count IS NULL
                     """,
                     (system.zaparoo_id,),
                 )
             ]
-            logger.info(f"  {system.zaparoo_id}: {len(game_ids)} games to process")
+            logger.info(f"  {system.zaparoo_id}: {len(game_ids)} games to process ({null_count} unscanned)")
             if not game_ids:
                 continue
 

@@ -151,6 +151,91 @@ Pass `zaparoo_id` values to `--systems`.
 | `Arduboy` | Arduboy |
 | `ScummVM` | ScummVM |
 
+## Arcade ETL
+
+Separate pipeline for MiSTer `.mra`-based arcade games. Looks up games on ScreenScraper by MAME ROM name (`setname.zip`) rather than by system CSV.
+
+### Required env vars
+
+```
+SS_DEV_ID
+SS_DEV_PASSWORD
+SS_USER_ID
+SS_USER_PASSWORD
+SS_SOFTNAME
+SS_THREADS
+MRA_PATH        # or pass --mra-path
+ARTIFACT_PATH   # or pass --artifact-path
+```
+
+Place in `.env` at the project root or at `--artifact-path`.
+
+### Usage
+
+```bash
+# Run all steps
+python arcade.py
+
+# Specify .mra directory and artifact output path
+python arcade.py --mra-path /media/fat/_Arcade --artifact-path /mnt/mister
+
+# Run specific steps
+python arcade.py --steps prepare-db mra-scan
+
+# Custom DB path
+python arcade.py --db /path/to/arcade_media.db
+
+# Verbose logging
+python arcade.py --verbose
+```
+
+### Available Steps
+
+- `prepare-db` — initialize database schema
+- `mra-scan` — parse `.mra` files, populate MRAs table
+- `fetch-game-details` — look up each game on ScreenScraper by `setname.zip`, store raw response and resolve `screenscraper_id`
+- `download-images` — download artwork for resolved games
+- `export-media` — export processed media to artifact path *(stub)*
+- `export-zaparoo-map` — export Zaparoo NFC mapping file *(stub)*
+
+### Module Usage
+
+```python
+from mister_media_db.arcade import ArcadeETLWorkflow
+
+workflow = ArcadeETLWorkflow(
+    db_path="arcade_media.db",
+    artifact_path="/mnt/mister",
+    mra_path="/media/fat/_Arcade",
+)
+workflow.run(steps=["prepare-db", "mra-scan", "fetch-game-details"])
+```
+
+## Database Recovery
+
+`recover_db.py` copies rows one at a time from a potentially-corrupted `mister_media.db` into a fresh `mister_recover.db`. Each row is an individual committed transaction so a corrupt page causes a single-row error rather than aborting the entire table. `GameImages` is processed last; each blob is PNG/JPEG-validated before insertion — truncated images are skipped and logged.
+
+Safe to interrupt (Ctrl-C) and resume; existing rows in the destination are skipped via `INSERT OR IGNORE`.
+
+```bash
+# Full recovery with defaults
+python recover_db.py
+
+# Custom source/dest
+python recover_db.py --source /path/to/mister_media.db --dest /path/to/mister_recover.db
+
+# Recover non-image tables first, GameImages separately
+python recover_db.py --tables CSV Games GameFetchResponses GameZaparooTitles
+python recover_db.py --tables GameImages
+
+# Verbose log (DEBUG level)
+python recover_db.py --verbose --log recover_debug.log
+```
+
+Progress is printed per row to stdout. Errors and skipped blobs go to `recover.log` (and WARNING+ to stderr).
+
+---
+
 ## Module Usage
 
 ```python

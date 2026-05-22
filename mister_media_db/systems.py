@@ -537,7 +537,7 @@ SYSTEMS: list[System] = [
         screenscraper_id=76,
     ),
     # Other
-    # Arcade must be run custom for MRA matching
+    # Arcade must be run custom for MRA matching from arcade.py
     # System(
     #     zaparoo_id="Arcade",
     #     mister_media_dirname="_Arcade",

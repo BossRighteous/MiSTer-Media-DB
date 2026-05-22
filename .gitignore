@@ -1,6 +1,7 @@
 csv/
 export/
 mister_media.db
+arcade_media.db
 .claude/
 
 # Byte-compiled / optimized / DLL files

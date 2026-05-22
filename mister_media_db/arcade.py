@@ -181,12 +181,12 @@ class ArcadeETLWorkflow:
                 errors += 1
                 continue
 
-            name = (root.findtext("n") or "").strip()
             setname = (root.findtext("setname") or "").strip()
+            name = (root.findtext("n") or root.findtext("name") or setname).strip()
             parent = (root.findtext("parent") or "").strip()
 
-            if not name or not setname:
-                logger.warning(f"  {mra_file.name}: missing <n> or <setname>, skipping")
+            if not setname:
+                logger.warning(f"  {mra_file.name}: missing <setname>, skipping")
                 errors += 1
                 continue
 
@@ -214,10 +214,12 @@ class ArcadeETLWorkflow:
             logger.error(f"  URL error fetching {label or url}: {e.reason}")
             return None
 
-    def _fetch_game_detail(self, game_id: int) -> tuple[int, Optional[bytes]]:
+    def _fetch_game_detail(self, setname: str) -> tuple[str, Optional[bytes]]:
         url = (
             "https://api.screenscraper.fr/api2/jeuInfos.php"
-            f"?gameid={game_id}"
+            f"?romtype=rom"
+            f"&romnom={urllib.parse.quote(setname + '.zip')}"
+            f"&systemeid=75"
             f"&devid={urllib.parse.quote(self.ss_dev_id)}"
             f"&devpassword={urllib.parse.quote(self.ss_dev_password)}"
             f"&softname={urllib.parse.quote(self.ss_softname)}"
@@ -225,7 +227,7 @@ class ArcadeETLWorkflow:
             f"&sspassword={urllib.parse.quote(self.ss_user_password)}"
             f"&output=json"
         )
-        return game_id, self._fetch_url(url, f"game {game_id}")
+        return setname, self._fetch_url(url, f"setname {setname}")
 
     def _fetch_remaining_requests(self) -> int:
         url = (
@@ -261,54 +263,50 @@ class ArcadeETLWorkflow:
         time.sleep(sleep_seconds)
 
     def step_fetch_game_details(self):
-        """Fetch game details from ScreenScraper for MRAs with a resolved screenscraper_id."""
-        game_ids = [
-            row[0]
+        """Fetch game details from ScreenScraper by ROM name for unresolved MRAs."""
+        setnames: List[tuple[str, str]] = [
+            (row[0], row[1])
             for row in self.conn.execute(
-                """
-                SELECT m.screenscraper_id FROM MRAs m
-                LEFT JOIN GameFetchResponses gfr ON m.screenscraper_id = gfr.screenscraper_id
-                WHERE m.screenscraper_id != 0 AND gfr.screenscraper_id IS NULL
-                """
+                "SELECT m.setname, m.name FROM MRAs m WHERE m.screenscraper_id = 0"
             )
         ]
-        total = self.conn.execute(
-            "SELECT COUNT(*) FROM MRAs WHERE screenscraper_id != 0"
-        ).fetchone()[0]
-        logger.info(f"  fetch-game-details: {len(game_ids)}/{total} games to fetch")
+        total = self.conn.execute("SELECT COUNT(*) FROM MRAs").fetchone()[0]
+        logger.info(f"  fetch-game-details: {len(setnames)}/{total} games to fetch")
 
-        for batch_start in range(0, len(game_ids), self.ss_threads):
-            batch = game_ids[batch_start:batch_start + self.ss_threads]
+        for batch_start in range(0, len(setnames), self.ss_threads):
+            batch = setnames[batch_start:batch_start + self.ss_threads]
             with ThreadPoolExecutor(max_workers=len(batch)) as executor:
-                futures = [executor.submit(self._fetch_game_detail, gid) for gid in batch]
+                futures = [executor.submit(self._fetch_game_detail, sn) for sn, _ in batch]
             last_rate_info: Optional[tuple[int, int]] = None
             for future in futures:
-                game_id, blob = future.result()
+                setname, blob = future.result()
                 if blob is None:
                     continue
+                try:
+                    payload = json.loads(blob)
+                    game_id = int(payload["response"]["jeu"]["id"])
+                    ssuser = payload["response"]["ssuser"]
+                    requests_today = int(ssuser["requeststoday"])
+                    max_requests = int(ssuser["maxrequestsperday"])
+                    last_rate_info = (requests_today, max_requests)
+                    logger.info(f"  setname {setname}: fetched (id={game_id}, {len(blob)} bytes), {requests_today}/{max_requests} requests today")
+                except (KeyError, ValueError, json.JSONDecodeError):
+                    logger.warning(f"  setname {setname}: could not parse game id or rate limit from response")
+                    continue
+                self.conn.execute(
+                    "UPDATE MRAs SET screenscraper_id = ? WHERE setname = ? AND screenscraper_id = 0",
+                    (game_id, setname),
+                )
                 self.conn.execute(
                     "INSERT OR IGNORE INTO GameFetchResponses (screenscraper_id, blob) VALUES (?, ?)",
                     (game_id, blob),
                 )
                 self.conn.commit()
-                try:
-                    payload = json.loads(blob)
-                    ssuser = payload["response"]["ssuser"]
-                    requests_today = int(ssuser["requeststoday"])
-                    max_requests = int(ssuser["maxrequestsperday"])
-                    last_rate_info = (requests_today, max_requests)
-                    logger.info(f"  game {game_id}: fetched ({len(blob)} bytes), {requests_today}/{max_requests} requests today")
-                except (KeyError, ValueError, json.JSONDecodeError):
-                    logger.warning(f"  Could not parse rate limit from response for game {game_id}")
             if last_rate_info and last_rate_info[0] >= last_rate_info[1]:
                 self._sleep_until_paris_midnight()
 
         done_count = self.conn.execute(
-            """
-            SELECT COUNT(*) FROM GameFetchResponses gfr
-            JOIN MRAs m ON gfr.screenscraper_id = m.screenscraper_id
-            WHERE m.screenscraper_id != 0
-            """
+            "SELECT COUNT(*) FROM MRAs WHERE screenscraper_id != 0"
         ).fetchone()[0]
         remaining = total - done_count
         if remaining:
@@ -321,10 +319,10 @@ class ArcadeETLWorkflow:
         _TARGET_TYPES = {
             MediaType.SSTITLE,
             MediaType.SS,
-            MediaType.BOX_2D,
-            MediaType.BOX_2D_SIDE,
-            MediaType.BOX_2D_BACK,
-            MediaType.BOX_3D,
+            MediaType.FLYER,
+            MediaType.WHEEL,
+            MediaType.MARQUEE,
+            MediaType.SCREENMARQUEE,
         }
         _FORMAT_CONTENT_TYPE = {
             "png": "image/png",

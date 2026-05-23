@@ -17,6 +17,7 @@ Usage:
 import argparse
 import logging
 import os
+import re
 import signal
 import sqlite3
 import sys
@@ -305,6 +306,91 @@ def recover_table(
 
 
 # ---------------------------------------------------------------------------
+# Re-copy mistakenly-skipped GameImages rows
+# ---------------------------------------------------------------------------
+_SKIPPED_RE = re.compile(
+    r"\[GameImages\] rowid=(\d+) pk=\S+: invalid blob "
+    r"\(content_type=\S+, blob_len=(\d+)\)"
+)
+_NOMEDIA_LEN = 7  # len("NOMEDIA")
+
+
+def recover_skipped_images(
+    src: sqlite3.Connection,
+    dst: sqlite3.Connection,
+    log_path: Path,
+    min_blob_len: int = _NOMEDIA_LEN + 1,
+) -> tuple[int, int, int]:
+    """
+    Parse recovery log for GameImages rows skipped as 'invalid blob' but with
+    blob_len > min_blob_len (i.e. not NOMEDIA stubs), then copy them without
+    re-running the validator.  Safe to re-run: INSERT OR IGNORE.
+    Returns (copied, not_found, errors).
+    """
+    columns = ["id", "screenscraper_id", "type", "region", "content_type", "blob"]
+    col_list = ", ".join(columns)
+    placeholders = ", ".join("?" * len(columns))
+    insert_sql = f"INSERT OR IGNORE INTO GameImages ({col_list}) VALUES ({placeholders})"
+
+    rowids: list[int] = []
+    try:
+        with open(log_path, encoding="utf-8") as f:
+            for line in f:
+                m = _SKIPPED_RE.search(line)
+                if m and int(m.group(2)) >= min_blob_len:
+                    rowids.append(int(m.group(1)))
+    except OSError as exc:
+        print(f"[recover-skipped] ERROR: cannot read log {log_path}: {exc}", flush=True)
+        return 0, 0, 1
+
+    total = len(rowids)
+    print(f"\n[recover-skipped] {total:,} skipped rows with blob_len >= {min_blob_len}", flush=True)
+    logging.info(f"[recover-skipped] {total:,} candidate rowids from {log_path}")
+
+    copied = not_found = errors = 0
+
+    for rowid in rowids:
+        if _shutdown:
+            print("[recover-skipped] Shutdown — stopping.", flush=True)
+            break
+        try:
+            row = src.execute(
+                f"SELECT {col_list} FROM GameImages WHERE rowid = ?", (rowid,)
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            logging.error(f"[recover-skipped] rowid={rowid}: read error: {exc}")
+            errors += 1
+            continue
+
+        if row is None:
+            logging.warning(f"[recover-skipped] rowid={rowid}: not found in source")
+            not_found += 1
+            continue
+
+        try:
+            dst.execute(insert_sql, row)
+            dst.commit()
+            copied += 1
+            pk = row[0]
+            print(
+                f"[recover-skipped] rowid={rowid} pk={pk}: OK ({copied:,}/{total:,})",
+                flush=True,
+            )
+            logging.debug(f"[recover-skipped] rowid={rowid} pk={pk}: copied")
+        except sqlite3.DatabaseError as exc:
+            logging.error(f"[recover-skipped] rowid={rowid}: write error: {exc}")
+            errors += 1
+
+    summary = (
+        f"[recover-skipped] COMPLETE: {copied:,} copied, "
+        f"{not_found:,} not found in source, {errors:,} errors"
+    )
+    print(summary, flush=True)
+    logging.info(summary)
+    return copied, not_found, errors
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -332,6 +418,14 @@ def main() -> None:
         help=(
             f"Only recover these tables (default: all in safe order). "
             f"Choices: {', '.join(_TABLE_NAMES)}"
+        ),
+    )
+    parser.add_argument(
+        "--recover-skipped", action="store_true",
+        help=(
+            "Re-copy GameImages rows that were skipped as 'invalid blob' but have "
+            "blob_len > 7 (i.e. not NOMEDIA stubs). Parses --log file for rowids. "
+            "If --tables is not also given, skips normal table recovery and runs only this step."
         ),
     )
     parser.add_argument(
@@ -392,9 +486,11 @@ def main() -> None:
     print(f"Source  : {src_path}", flush=True)
     print(f"Dest    : {dst_path}", flush=True)
     print(f"Log     : {log_path}", flush=True)
-    selected = args.tables or "(all, GameImages last)"
-    print(f"Tables : {selected}", flush=True)
-    logging.info(f"Recovery started: source={src_path} dest={dst_path} tables={selected}")
+    selected = args.tables or ("(none — recover-skipped only)" if args.recover_skipped else "(all, GameImages last)")
+    print(f"Tables  : {selected}", flush=True)
+    if args.recover_skipped:
+        print(f"Mode    : recover-skipped (log={log_path})", flush=True)
+    logging.info(f"Recovery started: source={src_path} dest={dst_path} tables={selected} recover_skipped={args.recover_skipped}")
 
     # Open source read-only to avoid any writes to the corrupt file.
     src = sqlite3.connect(f"file:{src_path}?mode=ro", uri=True)
@@ -407,11 +503,13 @@ def main() -> None:
     dst.executescript(_SCHEMA_SQL)
     dst.commit()
 
-    tables_to_run = (
-        [td for td in _TABLE_DEFS if td[0] in args.tables]
-        if args.tables
-        else _TABLE_DEFS
-    )
+    # If --recover-skipped with no --tables, skip normal table recovery.
+    if args.tables:
+        tables_to_run = [td for td in _TABLE_DEFS if td[0] in args.tables]
+    elif args.recover_skipped:
+        tables_to_run = []
+    else:
+        tables_to_run = _TABLE_DEFS
 
     grand_copied = grand_skipped = grand_errors = 0
 
@@ -425,6 +523,15 @@ def main() -> None:
             grand_copied += c
             grand_skipped += s
             grand_errors += e
+
+        if args.recover_skipped and not _shutdown:
+            if not log_path.exists():
+                print(f"[recover-skipped] ERROR: log not found: {log_path}", flush=True)
+            else:
+                c, s, e = recover_skipped_images(src, dst, log_path)
+                grand_copied += c
+                grand_skipped += s
+                grand_errors += e
     finally:
         print("\nClosing connections...", flush=True)
         try:

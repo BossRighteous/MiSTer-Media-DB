@@ -17,8 +17,9 @@ from pathlib import Path
 from typing import Optional, List
 from zoneinfo import ZoneInfo
 
-from mister_media_db.etl import _load_dotenv
+from mister_media_db.etl import _load_dotenv, _clean_text
 from mister_media_db.media_types import MEDIA_TYPE_MAP, MediaType
+from mister_media_db.utils import safe_game_name_for_filename
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,9 @@ class ArcadeETLWorkflow:
         "prepare-db",
         "mra-scan",
         "fetch-game-details",
+        "relate-unmatched-parents",
         "download-images",
+        "get-zaparoo-mediatitles",
         "export-media",
         "export-zaparoo-map",
     ]
@@ -132,7 +135,8 @@ class ArcadeETLWorkflow:
                 CREATE TABLE Games (
                     screenscraper_id INTEGER PRIMARY KEY,
                     name TEXT NOT NULL,
-                    image_count INTEGER
+                    image_count INTEGER,
+                    zaparoo_title TEXT
                 );
 
                 CREATE TABLE GameImages (
@@ -252,6 +256,35 @@ class ArcadeETLWorkflow:
             logger.warning(f"  Could not fetch rate limit info: {e}")
             return -1
 
+    def _extract_game_name(self, jeu: dict) -> Optional[str]:
+        noms = jeu.get("noms", [])
+        for preferred_region in ("ss", "us", "wor", "eu"):
+            for nom in noms:
+                if nom.get("region") == preferred_region and nom.get("text"):
+                    return nom["text"]
+        for nom in noms:
+            if nom.get("text"):
+                return nom["text"]
+        return None
+
+    def _post_json(self, url: str, body: bytes, label: str = "") -> Optional[dict]:
+        req = urllib.request.Request(
+            url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req) as response:
+                payload = json.loads(response.read())
+            return payload.get("result")
+        except urllib.error.HTTPError as e:
+            logger.error(f"  HTTP {e.code} posting {label or url}: {e.reason}")
+            return None
+        except urllib.error.URLError as e:
+            logger.error(f"  URL error posting {label or url}: {e.reason}")
+            return None
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning(f"  Cannot parse response for {label or url}: {e}")
+            return None
+
     def _sleep_until_paris_midnight(self) -> None:
         paris = ZoneInfo("Europe/Paris")
         now = datetime.now(paris)
@@ -313,6 +346,25 @@ class ArcadeETLWorkflow:
             logger.warning(f"  {done_count}/{total} fetch responses stored, {remaining} remaining — rerun needed")
         else:
             logger.info(f"  {done_count}/{total} fetch responses stored, complete")
+
+    def step_relate_unmatched_parents(self):
+        """Set screenscraper_id on unmatched MRAs by inheriting from their parent MRA."""
+        cursor = self.conn.execute(
+            """
+            UPDATE MRAs
+            SET screenscraper_id = (
+                SELECT p.screenscraper_id FROM MRAs p
+                WHERE p.setname = MRAs.parent AND p.screenscraper_id != 0
+            )
+            WHERE screenscraper_id = 0 AND parent != ''
+            AND EXISTS (
+                SELECT 1 FROM MRAs p
+                WHERE p.setname = MRAs.parent AND p.screenscraper_id != 0
+            )
+            """
+        )
+        self.conn.commit()
+        logger.info(f"  relate-unmatched-parents: {cursor.rowcount} MRAs updated from parent")
 
     def step_download_images(self):
         """Download game images for target media types; skips already-fetched rows."""
@@ -383,7 +435,8 @@ class ArcadeETLWorkflow:
 
             try:
                 payload = json.loads(row[0])
-                medias = payload["response"]["jeu"]["medias"]
+                jeu = payload["response"]["jeu"]
+                medias = jeu["medias"]
             except (KeyError, ValueError, json.JSONDecodeError) as e:
                 logger.warning(f"  game {screenscraper_id}: cannot parse medias: {e}")
                 continue
@@ -392,9 +445,14 @@ class ArcadeETLWorkflow:
                 m for m in medias
                 if MEDIA_TYPE_MAP.get(m.get("type")) in _TARGET_TYPES
             ]
+            ss_name = self._extract_game_name(jeu) or mra_name
             self.conn.execute(
                 "INSERT OR IGNORE INTO Games (screenscraper_id, name) VALUES (?, ?)",
-                (screenscraper_id, mra_name),
+                (screenscraper_id, ss_name),
+            )
+            self.conn.execute(
+                "UPDATE Games SET name = ? WHERE screenscraper_id = ?",
+                (ss_name, screenscraper_id),
             )
             self.conn.execute(
                 "UPDATE Games SET image_count = ? WHERE screenscraper_id = ? AND image_count IS NULL",
@@ -475,10 +533,188 @@ class ArcadeETLWorkflow:
         else:
             logger.info(f"  {complete}/{processed} games fully downloaded, complete")
 
+    def step_get_zaparoo_mediatitles(self):
+        """Fetch zaparoo media title slugs for arcade games."""
+        zaparoo_host = os.environ.get("ZAPAROO_HOST")
+        if not zaparoo_host:
+            logger.error("  ZAPAROO_HOST env var not set: skipping get-zaparoo-mediatitles")
+            return
+
+        base_url = f"http://{zaparoo_host}:7497/api/v0.1"
+
+        game_rows: List[tuple[int, str, Optional[str]]] = [
+            (row[0], row[1], row[2])
+            for row in self.conn.execute(
+                "SELECT screenscraper_id, name, zaparoo_title FROM Games WHERE screenscraper_id != 0"
+            )
+        ]
+        logger.info(f"  get-zaparoo-mediatitles: {len(game_rows)} games for zaparoo_title lookup")
+
+        for screenscraper_id, name, zaparoo_title in game_rows:
+            if zaparoo_title is not None:
+                continue
+            body = json.dumps({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "mediatitle.frompath",
+                "params": {"systemId": "Arcade", "path": name},
+            }).encode("utf-8")
+            result = self._post_json(base_url, body, label=f"Arcade/{name}")
+            if result is None:
+                continue
+            self.conn.execute(
+                "UPDATE Games SET zaparoo_title = ? WHERE screenscraper_id = ?",
+                (json.dumps(result), screenscraper_id),
+            )
+            self.conn.commit()
+
+        mra_rows: List[tuple[int, str]] = [
+            (row[0], row[1])
+            for row in self.conn.execute(
+                "SELECT screenscraper_id, name FROM MRAs WHERE screenscraper_id != 0"
+            )
+        ]
+        logger.info(f"  get-zaparoo-mediatitles: {len(mra_rows)} MRAs for slug collection")
+
+        inserted = 0
+        for screenscraper_id, name in mra_rows:
+            existing_slugs: set[str] = {
+                row[0]
+                for row in self.conn.execute(
+                    "SELECT slug FROM GameZaparooTitles WHERE screenscraper_id = ?",
+                    (screenscraper_id,),
+                )
+            }
+            body = json.dumps({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "mediatitle.frompath",
+                "params": {"systemId": "Arcade", "path": name},
+            }).encode("utf-8")
+            result = self._post_json(base_url, body, label=f"Arcade/{name}")
+            if result is None:
+                continue
+            slug = result.get("slug")
+            if not slug or slug in existing_slugs:
+                continue
+            self.conn.execute(
+                "INSERT OR IGNORE INTO GameZaparooTitles (screenscraper_id, slug, result)"
+                " VALUES (?, ?, ?)",
+                (screenscraper_id, slug, json.dumps(result)),
+            )
+            self.conn.commit()
+            inserted += 1
+
+        logger.info(f"  get-zaparoo-mediatitles: {inserted} new MRA slug records inserted")
+
     def step_export_media(self):
-        """[STUB] Export media files to artifact_path export directory."""
-        logger.info("[STUB] export-media: not yet implemented")
+        """Export arcade media files to artifact_path/export/Arcade/media/."""
+        _CONTENT_TYPE_EXT = {
+            "image/png": "png",
+            "image/jpeg": "jpg",
+        }
+
+        export_dir = self.artifact_path / "export" / "Arcade" / "media"
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        cursor = self.conn.execute(
+            """
+            SELECT g.name, gi.type, gi.region, gi.content_type, gi.blob
+            FROM Games g
+            JOIN GameImages gi ON g.screenscraper_id = gi.screenscraper_id
+            ORDER BY g.name, gi.type, gi.region
+            """
+        )
+
+        exported = 0
+        for name, media_type, region, content_type, blob in cursor:
+            ext = _CONTENT_TYPE_EXT.get(content_type)
+            if not ext:
+                logger.warning(f"  Unknown content_type '{content_type}' for {name}: skipping")
+                continue
+
+            safe_name = safe_game_name_for_filename(name)
+            game_dir = export_dir / safe_name
+            game_dir.mkdir(parents=True, exist_ok=True)
+
+            parts = [safe_name]
+            if region:
+                parts.append(region)
+            parts.append(media_type)
+            filename = ".".join(parts) + f".{ext}"
+
+            dest = game_dir / filename
+            if dest.exists():
+                continue
+            dest.write_bytes(blob)
+            exported += 1
+
+        logger.info(f"  export-media: {exported} images exported to {export_dir}")
 
     def step_export_zaparoo_map(self):
-        """[STUB] Export Zaparoo NFC mapping file for arcade games."""
-        logger.info("[STUB] export-zaparoo-map: not yet implemented")
+        """Export zaparoometa JSON fragments per game to ./export/Arcade/zaparoo-meta/."""
+        system_dir = self.artifact_path / "export" / "Arcade" / "zaparoo-meta"
+        system_dir.mkdir(parents=True, exist_ok=True)
+
+        slugs_by_game: dict[int, list[str]] = {}
+        for row in self.conn.execute(
+            "SELECT screenscraper_id, slug FROM GameZaparooTitles ORDER BY id"
+        ):
+            slugs_by_game.setdefault(row[0], []).append(row[1])
+
+        rows = self.conn.execute(
+            """
+            SELECT g.screenscraper_id, g.name, g.zaparoo_title, gfr.blob
+            FROM Games g
+            JOIN GameFetchResponses gfr ON g.screenscraper_id = gfr.screenscraper_id
+            ORDER BY g.name
+            """
+        ).fetchall()
+
+        exported = 0
+        for screenscraper_id, name, zaparoo_title_json, blob in rows:
+            try:
+                payload = json.loads(blob)
+                jeu = payload["response"]["jeu"]
+            except (KeyError, ValueError, json.JSONDecodeError) as e:
+                logger.warning(f"  {name}: cannot parse response: {e}")
+                continue
+
+            game_title_slug = None
+            if zaparoo_title_json:
+                try:
+                    game_title_slug = json.loads(zaparoo_title_json).get("slug")
+                except (ValueError, json.JSONDecodeError):
+                    pass
+
+            slugs = slugs_by_game.get(screenscraper_id, [])
+            record = {
+                "screenscraper_id": int(jeu["id"]),
+                "name": safe_game_name_for_filename(name),
+                "publisher": jeu.get("editeur", {}).get("text"),
+                "developer": jeu.get("developpeur", {}).get("text"),
+                "players": jeu.get("joueurs", {}).get("text"),
+                "system": jeu.get("systeme", {}).get("text"),
+                "description": [
+                    {**s, "text": _clean_text(s["text"])} if "text" in s else s
+                    for s in jeu.get("synopsis", [])
+                ] or None,
+                "dates": jeu.get("dates"),
+                "genres": [
+                    nom["text"]
+                    for genre in jeu.get("genres", [])
+                    for nom in genre.get("noms", [])
+                    if nom.get("langue") == "en" and nom.get("text")
+                ],
+                "game_title_slug": game_title_slug,
+                "known_title_slugs": slugs,
+            }
+
+            safe_name = safe_game_name_for_filename(name)
+            dest = system_dir / f"{safe_name}.json"
+            if dest.exists():
+                continue
+            dest.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+            exported += 1
+
+        logger.info(f"  export-zaparoo-map: {exported}/{len(rows)} zaparoometa files written to {system_dir}")

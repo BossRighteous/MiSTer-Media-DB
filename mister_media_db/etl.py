@@ -28,8 +28,8 @@ if hasattr(signal, "SIGBREAK"):
     signal.signal(signal.SIGBREAK, _sigbreak_handler)
 
 from mister_media_db.media_types import MEDIA_TYPE_MAP, MediaType
-from mister_media_db.slugs import slugify_game_str
 from mister_media_db.systems import SYSTEMS, System
+from mister_media_db.utils import safe_game_name_for_filename
 
 logger = logging.getLogger(__name__)
 
@@ -393,9 +393,13 @@ class ETLWorkflow:
         )
         time.sleep(sleep_seconds)
 
-    def _fetch_url(self, url: str, label: str = "") -> Optional[bytes]:
+    def _fetch_url(self, url: str, label: str = "", require_content_type: Optional[str] = None) -> Optional[bytes]:
         try:
             with urllib.request.urlopen(url) as response:
+                content_type = response.headers.get("Content-Type", "")
+                if require_content_type and not content_type.startswith(require_content_type):
+                    logger.warning(f"  Unexpected content type for {label or url}: '{content_type}' — skipping")
+                    return None
                 return response.read()
         except urllib.error.HTTPError as e:
             logger.error(f"  HTTP {e.code} fetching {label or url}: {e.reason}")
@@ -549,7 +553,7 @@ class ETLWorkflow:
                     with ThreadPoolExecutor(max_workers=len(sub_batch)) as executor:
                         batch_futures = [
                             (mt, region, content_type, executor.submit(
-                                self._fetch_url, url, f"game {screenscraper_id} {mt.name}[{region}]"
+                                self._fetch_url, url, f"game {screenscraper_id} {mt.name}[{region}]", "image/"
                             ))
                             for mt, region, url, content_type in sub_batch
                         ]
@@ -610,7 +614,7 @@ class ETLWorkflow:
         except (json.JSONDecodeError, KeyError) as e:
             logger.warning(f"  Cannot parse response for {label or url}: {e}")
             return None
-
+        
     def step_get_zaparoo_mediatitles(self, systems: List[System]):
         """Fetch zaparoo media title slugs for all rom filenames via Zaparoo JSON-RPC API."""
         zaparoo_host = os.environ.get("ZAPAROO_HOST")
@@ -621,11 +625,11 @@ class ETLWorkflow:
         base_url = f"http://{zaparoo_host}:7497/api/v0.1"
 
         for system in systems:
-            game_ids: List[int] = [
-                row[0]
+            game_rows: List[tuple[int, str, Optional[str]]] = [
+                (row[0], row[1], row[2])
                 for row in self.conn.execute(
                     """
-                    SELECT g.screenscraper_id
+                    SELECT g.screenscraper_id, g.name, g.zaparoo_title
                     FROM Games g
                     JOIN GameFetchResponses gfr ON g.screenscraper_id = gfr.screenscraper_id
                     WHERE g.system_id = ?
@@ -633,10 +637,28 @@ class ETLWorkflow:
                     (system.zaparoo_id,),
                 )
             ]
-            logger.info(f"  {system.zaparoo_id}: {len(game_ids)} game responses to process")
+            logger.info(f"  {system.zaparoo_id}: {len(game_rows)} game responses to process")
 
             inserted_system = 0
-            for screenscraper_id in game_ids:
+            for screenscraper_id, game_name, zaparoo_title in game_rows:
+                if zaparoo_title is None:
+                    title_body = json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "mediatitle.frompath",
+                        "params": {
+                            "systemId": system.zaparoo_id,
+                            "path": game_name,
+                        },
+                    }).encode("utf-8")
+                    title_result = self._post_json(base_url, title_body, label=f"{system.zaparoo_id}/{game_name}")
+                    if title_result:
+                        self.conn.execute(
+                            "UPDATE Games SET zaparoo_title = ? WHERE screenscraper_id = ?",
+                            (json.dumps(title_result), screenscraper_id),
+                        )
+                        self.conn.commit()
+
                 row = self.conn.execute(
                     "SELECT blob FROM GameFetchResponses WHERE screenscraper_id = ?",
                     (screenscraper_id,),
@@ -651,14 +673,6 @@ class ETLWorkflow:
                 except (KeyError, ValueError, json.JSONDecodeError) as e:
                     logger.warning(f"  {system.zaparoo_id}: cannot parse roms: {e}")
                     continue
-
-                zaparoo_title = _pick_nom(jeu.get("noms", []))
-                if zaparoo_title:
-                    self.conn.execute(
-                        "UPDATE Games SET zaparoo_title = ? WHERE screenscraper_id = ? AND zaparoo_title IS NULL",
-                        (zaparoo_title, screenscraper_id),
-                    )
-                    self.conn.commit()
 
                 existing_slugs: set[str] = {
                     row[0]
@@ -705,17 +719,16 @@ class ETLWorkflow:
             logger.info(f"  {system.zaparoo_id}: {inserted_system} new slug records inserted")
 
     def step_export_media(self, systems: List[System]):
-        """Export media files to ./export/media/{system.mister_media_dirname}/."""
+        """Export media files to ./export/{system.mister_media_dirname}/media/."""
         _CONTENT_TYPE_EXT = {
             "image/png": "png",
             "image/jpeg": "jpg",
         }
-        _INVALID_CHARS = str.maketrans('\\/:*?"<>|', '_________')
 
-        base = self.artifact_path / "export" / "media"
+        base = self.artifact_path / "export"
 
         for system in systems:
-            system_dir = base / system.mister_media_dirname
+            system_dir = base / system.mister_media_dirname / "media"
             system_dir.mkdir(parents=True, exist_ok=True)
 
             cursor = self.conn.execute(
@@ -736,13 +749,17 @@ class ETLWorkflow:
                     logger.warning(f"  Unknown content_type '{content_type}' for {name}: skipping")
                     continue
 
-                safe_name = name.translate(_INVALID_CHARS)
-                parts = [safe_name, media_type]
+                safe_name = safe_game_name_for_filename(name)
+                game_dir = system_dir / safe_name
+                game_dir.mkdir(parents=True, exist_ok=True)
+
+                parts = [safe_name]
                 if region:
                     parts.append(region)
+                parts.append(media_type)
                 filename = ".".join(parts) + f".{ext}"
 
-                dest = system_dir / filename
+                dest = game_dir / filename
                 if dest.exists():
                     continue
                 dest.write_bytes(blob)
@@ -751,17 +768,29 @@ class ETLWorkflow:
             logger.info(f"  {system.zaparoo_id}: {exported} images exported to {system_dir}")
 
     def step_export_zaparoo_map(self, systems: List[System]):
-        """Export zaparoometa JSON fragments per game to ./export/zaparoometa/."""
-        _INVALID_CHARS = str.maketrans('\\/:*?"<>|', '_________')
-        base = self.artifact_path / "export" / "zaparoometa"
+        """Export zaparoometa JSON fragments per game to ./export/{system}/zaparoo-meta/."""
+        base = self.artifact_path / "export"
 
         for system in systems:
-            system_dir = base / system.mister_media_dirname
+            system_dir = base / system.mister_media_dirname / "zaparoo-meta"
             system_dir.mkdir(parents=True, exist_ok=True)
+
+            slugs_by_game: dict[int, list[str]] = {}
+            for row in self.conn.execute(
+                """
+                SELECT gzt.screenscraper_id, gzt.slug
+                FROM GameZaparooTitles gzt
+                JOIN Games g ON gzt.screenscraper_id = g.screenscraper_id
+                WHERE g.system_id = ?
+                ORDER BY gzt.id
+                """,
+                (system.zaparoo_id,),
+            ):
+                slugs_by_game.setdefault(row[0], []).append(row[1])
 
             rows = self.conn.execute(
                 """
-                SELECT g.name, gfr.blob
+                SELECT g.screenscraper_id, g.name, g.zaparoo_title, gfr.blob
                 FROM Games g
                 JOIN GameFetchResponses gfr ON g.screenscraper_id = gfr.screenscraper_id
                 WHERE g.system_id = ?
@@ -771,7 +800,7 @@ class ETLWorkflow:
             ).fetchall()
 
             exported = 0
-            for name, blob in rows:
+            for screenscraper_id, name, zaparoo_title_json, blob in rows:
                 try:
                     payload = json.loads(blob)
                     jeu = payload["response"]["jeu"]
@@ -779,8 +808,16 @@ class ETLWorkflow:
                     logger.warning(f"  {system.zaparoo_id} / {name}: cannot parse response: {e}")
                     continue
 
+                game_title_slug = None
+                if zaparoo_title_json:
+                    try:
+                        game_title_slug = json.loads(zaparoo_title_json).get("slug")
+                    except (ValueError, json.JSONDecodeError):
+                        pass
+
                 record = {
                     "screenscraper_id": int(jeu["id"]),
+                    "name": safe_game_name_for_filename(name),
                     "publisher": jeu.get("editeur", {}).get("text"),
                     "developer": jeu.get("developpeur", {}).get("text"),
                     "players": jeu.get("joueurs", {}).get("text"),
@@ -790,23 +827,18 @@ class ETLWorkflow:
                         for s in jeu.get("synopsis", [])
                     ] or None,
                     "dates": jeu.get("dates"),
-                    "genres": [genre["noms"] for genre in jeu.get("genres", [])],
-                    "known_title_slugs": list(dict.fromkeys(
-                        s for rom in jeu.get("roms", [])
-                        if (s := slugify_game_str(
-                            Path(rom["romfilename"]).stem
-                        ))
-                    )),
-                    "known_hack_title_slugs": list(dict.fromkeys(
-                        s for hack in jeu.get("hacks", [])
-                        if (s := slugify_game_str(
-                            Path(hack["filename"]).stem
-                        ))
-                    )),
+                    "genres": [
+                        nom["text"]
+                        for genre in jeu.get("genres", [])
+                        for nom in genre.get("noms", [])
+                        if nom.get("langue") == "en" and nom.get("text")
+                    ],
+                    "game_title_slug": game_title_slug,
+                    "known_title_slugs": slugs_by_game.get(screenscraper_id, []),
                 }
 
-                safe_name = name.translate(_INVALID_CHARS)
-                dest = system_dir / f"{safe_name}.zaparoometa.json"
+                safe_name = safe_game_name_for_filename(name)
+                dest = system_dir / f"{safe_name}.json"
                 if dest.exists():
                     continue
                 dest.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")

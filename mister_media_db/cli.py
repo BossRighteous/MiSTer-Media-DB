@@ -60,7 +60,7 @@ Examples:
         nargs="+",
         metavar="STEP",
         help="Steps to run (space-separated). Available: prepare-db, fetch-csvs, process-system-csv, "
-        "fetch-game-details, download-images, export-media, export-zaparoo-map",
+        "fetch-game-details, download-images, get-zaparoo-mediatitles, export-media, export-zaparoo-map",
     )
 
     parser.add_argument(

@@ -1,7 +1,11 @@
 """Shared utility functions."""
 
-_FILENAME_INVALID_CHARS = str.maketrans('\\/:*?"<>|', '_________')
+import re
+
+_FILENAME_INVALID_CHARS = str.maketrans('\\/:*?"<>|\t\r\n', " --  '      ")
 
 
 def safe_game_name_for_filename(name: str) -> str:
-    return name.translate(_FILENAME_INVALID_CHARS)
+    name = name.translate(_FILENAME_INVALID_CHARS)
+    name = re.sub(r' {2,}', ' ', name)
+    return name.strip()

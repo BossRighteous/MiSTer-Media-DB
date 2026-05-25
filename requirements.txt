@@ -2,3 +2,4 @@
 # sqlite3 is part of Python stdlib
 
 tzdata  # IANA timezone database for Windows (zoneinfo stdlib needs this on Windows)
+Pillow  # image processing for export (resize, crop, convert)

@@ -247,3 +247,25 @@ workflow.run(
     systems=["nes", "snes"]
 )
 ```
+
+## Basic Batch
+
+My opinionated dump routine. Generates a gamelist.xml mapped to all Zaparoo title slugs for every known rom in the captured romsets
+
+Images licensed under the terms of Creative Commons
+[Attribution-NonCommercial-ShareAlike 4.0 International](http://creativecommons.org/licenses/by-nc-sa/4.0/) Fair use under... whatever keeps libretro hosting image content?
+
+
+Dumps in releases unles that becomes an issue, but it's CreateCommons sourced
+
+- Capped dimensions at 320x320 max, ratio scaled with Pillow
+- Descriptions in English
+- Screenshots as PNG, NEAREST sampling, oxipng optimized
+- Boxart2d as JPEG (80 quality), LANCZOS sampling
+
+```
+python basic_batch_export.py                        # both types
+python basic_batch_export.py -m screenshot          # screenshots only
+python basic_batch_export.py -m boxart2d            # boxart only
+python basic_batch_export.py -m screenshot boxart2d # explicit both
+```
